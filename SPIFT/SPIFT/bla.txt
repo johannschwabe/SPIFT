@@ -1,0 +1,210 @@
+
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+#include "cuComplex.h"
+
+#include <stdio.h>
+#include <algorithm>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <chrono>
+
+cudaError_t initData(const int matrixDim, const int blockDim, cuDoubleComplex* res, cuDoubleComplex** shift);
+
+constexpr int matrixIndex(const int matrix_dim, const int block_dim, int block_Idx, int block_Idy, int thread_idx) {
+    return block_Idx * block_dim * matrix_dim + thread_idx * matrix_dim + block_Idy * block_dim;
+}
+
+constexpr int rowShiftedVectorIndex(const int matrix_dim, const int shift, const int index) {
+    return (shift + index) % matrix_dim;
+}
+
+__global__ void updateWithRowShift(cuDoubleComplex *dev_matrix, const cuDoubleComplex* dev_vector, const int matrix_dim, const int shift)
+{     
+   
+    if (blockIdx.x * blockDim.x + threadIdx.x < matrix_dim) {
+        unsigned int start_index = matrixIndex(matrix_dim, blockDim.x, blockIdx.x, blockIdx.y, threadIdx.x);
+        int end = std::min(matrix_dim - blockIdx.y * blockDim.x, blockDim.x);
+        for (int i = 0; i < end; i++) {
+            int vectorPos = rowShiftedVectorIndex(matrix_dim, shift * threadIdx.x + blockDim.x * blockIdx.y + blockIdx.x * blockDim.x, i);
+            dev_matrix[start_index + i].x += dev_vector[vectorPos].x;
+            dev_matrix[start_index + i].y += dev_vector[vectorPos].y;
+
+        }
+    }
+
+}
+
+
+
+
+int main()
+{
+
+
+    const int matrixDim = 2048;
+    const int blockDim = 32;
+
+    cuDoubleComplex *res_matrix = new cuDoubleComplex[matrixDim * matrixDim];
+    cuDoubleComplex* shift[30];
+    for (int i = 0; i < 30; ++i) {
+        cuDoubleComplex bla[matrixDim];
+        shift[i] = bla;
+    }
+
+    // Add vectors in parallel.
+    cudaError_t cudaStatus = initData(matrixDim, blockDim, res_matrix, shift);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "addWithCuda failed!");
+        return 1;
+    }
+
+
+    // cudaDeviceReset must be called before exiting in order for profiling and
+    // tracing tools such as Nsight and Visual Profiler to show complete traces.
+    cudaStatus = cudaDeviceReset();
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaDeviceReset failed!");
+        return 1;
+    }
+
+    free(res_matrix);
+    return 0;
+}
+
+int generateShift(cuDoubleComplex** shift, cuDoubleComplex* dev_vector, const int matrix_dim) {
+
+    // Copy new shift from host memory to GPU buffers.
+    auto cudaStatus = cudaMemcpy(dev_vector, shift[std::rand() % 30], matrix_dim * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
+        return cudaStatus;
+    }
+
+    return std::rand()%100;
+}
+
+
+cudaError iteration(cuDoubleComplex* dev_matrix, cuDoubleComplex* dev_vector, const int matrix_dim, const int block_dim, cuDoubleComplex** shift) {
+    int shift_length = generateShift(shift, dev_vector, matrix_dim);
+    
+    int nr_blocks = ceil((double)matrix_dim / (double)block_dim);
+    dim3* blockDim = new dim3(block_dim, 1);
+    dim3* gridDim = new dim3(nr_blocks, nr_blocks);
+
+
+    updateWithRowShift <<<*gridDim, * blockDim >>> (dev_matrix, dev_vector, matrix_dim, shift_length);
+
+
+
+    // Check for any errors launching the kernel
+    auto cudaStatus = cudaGetLastError();
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "updateWithRowShift launch failed: %s\n", cudaGetErrorString(cudaStatus));
+        return cudaStatus;
+    }
+
+    // cudaDeviceSynchronize waits for the kernel to finish, and returns
+    // any errors encountered during the launch.
+    cudaStatus = cudaDeviceSynchronize();
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching updateWithRowShift!\n", cudaStatus);
+        return cudaStatus;
+    }
+    return cudaSuccess;
+
+
+}
+
+// Helper function to init data and launch iteration
+cudaError_t initData(const int matrixDim, const int blockDim, cuDoubleComplex* res, cuDoubleComplex **shift)
+{
+    cuDoubleComplex *dev_vector = 0;
+    cuDoubleComplex *dev_matrix = 0;
+    cudaError_t cudaStatus;
+
+    for (int x = 0; x < matrixDim * matrixDim; ++x) {
+        cuDoubleComplex next;
+        next.x = 0;
+        next.y = 0;
+
+        res[x] = next;
+    }
+    // Choose which GPU to run on, change this on a multi-GPU system.
+    cudaStatus = cudaSetDevice(1);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+        return cudaStatus;
+    }
+
+    // Allocate GPU buffers for matrix
+    cudaStatus = cudaMalloc((void**)&dev_matrix, matrixDim * matrixDim * sizeof(cuDoubleComplex));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc failed!");
+        return cudaStatus;
+    }
+    
+
+    cudaArray* dev_texture_vector = 0;
+
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
+
+    cudaStatus = cudaMallocArray(&dev_texture_vector, &channelDesc, matrixDim * 2 , 1, cudaArrayDefault);
+    /*
+    cudaStatus = cudaMalloc((void**)&dev_vector, matrixDim * sizeof(cuDoubleComplex));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc failed!");
+        return cudaStatus;
+    }
+    */
+    // Copy input Matrix from host memory to GPU buffers.
+    cudaStatus = cudaMemcpy(dev_matrix, res, matrixDim * matrixDim * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
+        return cudaStatus;
+    }
+
+    std::uniform_real_distribution<> dist(0, 1);
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    for (int j = 0; j < 30; ++j) {
+        for (int x = 0; x < matrixDim; ++x) {
+            cuDoubleComplex next;
+            next.x = 3;
+            next.y = 2;
+            
+            next.x = dist(gen);
+            next.y = dist(gen);
+            shift[j][x] = next;
+        }
+    }
+    std::cout << "lauched" << std::endl;
+    int iterations = 100000;
+
+    auto t1 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        cudaStatus = iteration(dev_matrix, dev_vector, matrixDim, blockDim, shift);
+
+        // Check for any errors in iteration
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+            return cudaStatus;
+        }
+    }
+
+    auto t2 = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    std::cout << "terminated "<< iterations <<"  "<< matrixDim << " dim, time: " << duration <<"ms"<< std::endl;
+    std::cout << "time per iteration: " << duration / (double)iterations << std::endl;
+
+    // Copy output vector from GPU buffer to host memory.
+    cudaStatus = cudaMemcpy(res, dev_matrix, matrixDim* matrixDim * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
+        return cudaStatus;
+    }
+
+    return cudaSuccess;
+
+}

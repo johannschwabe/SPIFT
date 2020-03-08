@@ -13,11 +13,15 @@
 
 cudaError_t initData(const int matrixDim, const int blockDim, cuFloatComplex* res, float** shift);
 
-constexpr int matrixIndex(const int matrix_dim, const int block_dim, int block_Idx, int block_Idy, int thread_idx) {
+constexpr int matrixStartIndexRow(const int matrix_dim, const int block_dim, int block_Idx, int block_Idy, int thread_idx) {
     return block_Idx * block_dim * matrix_dim + thread_idx * matrix_dim + block_Idy * block_dim;
 }
 
-constexpr int rowShiftedVectorIndex(const int matrix_dim, const int shift, const int index) {
+constexpr int matrixStartIndexColumn(const int matrix_dim, const int block_dim, int block_Idx, int block_Idy, int thread_idx) {
+    return block_Idx * block_dim * matrix_dim + block_Idy * block_dim + thread_idx;
+}
+
+constexpr int shiftedVectorIndex(const int matrix_dim, const int shift, const int index) {
     return ((shift + index) % matrix_dim) * 2;
 }
 
@@ -25,20 +29,33 @@ __global__ void updateWithRowShift(cuFloatComplex* dev_matrix, cudaTextureObject
 {
 
     if (blockIdx.x * blockDim.x + threadIdx.x < matrix_dim) {
-        unsigned int start_index = matrixIndex(matrix_dim, blockDim.x, blockIdx.x, blockIdx.y, threadIdx.x);
+        unsigned int start_index = matrixStartIndexRow(matrix_dim, blockDim.x, blockIdx.x, blockIdx.y, threadIdx.x);
         int end = std::min(matrix_dim - blockIdx.y * blockDim.x, blockDim.x);
         for (int i = 0; i < end; i++) {
-            int vectorPos = rowShiftedVectorIndex(matrix_dim, shift * threadIdx.x + blockDim.x * blockIdx.y + blockIdx.x * blockDim.x, i);
+            int vectorPos = shiftedVectorIndex(matrix_dim, shift * threadIdx.x + blockDim.x * blockIdx.y + blockIdx.x * blockDim.x, i);
 
             dev_matrix[start_index + i].x += tex2D<float>(dev_vector, vectorPos, 0);
             dev_matrix[start_index + i].y += tex2D<float>(dev_vector, vectorPos + 1, 0);
-
         }
     }
 
 }
 
+__global__ void updateWithColumnShift(cuFloatComplex* dev_matrix, cudaTextureObject_t dev_vector, const int matrix_dim, const int shift)
+{
+    if (blockIdx.x * blockDim.x + threadIdx.x < matrix_dim) {
+        unsigned int start_index = matrixStartIndexColumn(matrix_dim, blockDim.x, blockIdx.x, blockIdx.y, threadIdx.x);
+        int end = std::min(matrix_dim - blockIdx.x * blockDim.x, blockDim.x);
+        for (int i = 0; i < end; i++) {
+            int vectorPos = shiftedVectorIndex(matrix_dim, shift * threadIdx.x + blockDim.x * blockIdx.y * shift + blockIdx.x * blockDim.x, i);
+            
+            dev_matrix[start_index + i * matrix_dim].x += tex2D<float>(dev_vector, vectorPos, 0);
+            dev_matrix[start_index + i * matrix_dim].y += tex2D<float>(dev_vector, vectorPos + 1, 0);
+            
+        }
+    }
 
+}
 
 
 int main()
@@ -46,7 +63,7 @@ int main()
 
 
     const int matrixDim = 2048;
-    const int blockDim = 32;
+    const int blockDim = 16;
 
     cuFloatComplex* res_matrix = new cuFloatComplex[matrixDim * matrixDim];
     float* shift[30];
@@ -109,7 +126,7 @@ void initTexture(int matrix_dim, float** shift, cudaTextureObject_t* texObj, cud
 int generateShift(int matrix_dim, float** shift, cudaArray* *cuArray) {
     int x = std::rand() % 30;
     cudaMemcpyToArray(*cuArray, 0, 0, shift[x], matrix_dim * 2 * sizeof(float), cudaMemcpyHostToDevice);
-    return 1;
+    return 5;
 }
 
 cudaError iteration(cuFloatComplex* dev_matrix, const int matrix_dim, const int block_dim, float** shift, cudaArray* *cuArray, cudaTextureObject_t* texObj) {
@@ -119,8 +136,8 @@ cudaError iteration(cuFloatComplex* dev_matrix, const int matrix_dim, const int 
     dim3* blockDim = new dim3(block_dim, 1);
     dim3* gridDim = new dim3(nr_blocks, nr_blocks);
 
-    updateWithRowShift << <*gridDim, * blockDim >> > (dev_matrix, *texObj, matrix_dim, shift_length);
-
+    //updateWithRowShift << <*gridDim, * blockDim >> > (dev_matrix, *texObj, matrix_dim, shift_length);
+    updateWithColumnShift << <*gridDim, * blockDim >> > (dev_matrix, *texObj, matrix_dim, shift_length);
 
 
     // Check for any errors launching the kernel
@@ -184,8 +201,8 @@ cudaError_t initData(const int matrixDim, const int blockDim, cuFloatComplex* re
     std::mt19937 gen(rd());
     for (int j = 0; j < 30; ++j) {
         for (int x = 0; x < matrixDim * 2; ++x) {
-            shift[j][x] = j;
-            //shift[j][x] = dist(gen);
+            //shift[j][x] = x;
+            shift[j][x] = dist(gen);
         }
     }
     cudaTextureObject_t texObj = 0;
@@ -216,10 +233,11 @@ cudaError_t initData(const int matrixDim, const int blockDim, cuFloatComplex* re
         fprintf(stderr, "cudaMemcpy failed!");
         return cudaStatus;
     }
+    
     /*
     for (int i = 0; i < matrixDim; ++i) {
         for (int j = 0; j < matrixDim; ++j) {
-            std::cout << "(" << res[i * matrixDim + j].x << ", " << res[i * matrixDim + j].y << "), ";
+            std::cout << "(" << std::setfill(' ') << std::setw(2) << res[i * matrixDim + j].x << ", " << std::setfill(' ') << std::setw(2) << res[i * matrixDim + j].y << "), ";
         }
         std::cout << std::endl;
     }

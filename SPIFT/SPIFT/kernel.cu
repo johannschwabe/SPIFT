@@ -13,6 +13,7 @@
 #include <fstream>
 #include <thread>
 
+
 constexpr int matrixStartIndexRow(const int matrix_dim, const int block_dim, int block_Idx, int block_Idy, int thread_idx) {
     return block_Idx * block_dim * matrix_dim + thread_idx * matrix_dim + block_Idy * block_dim;
 }
@@ -32,7 +33,7 @@ __global__ void updateWithRowShift(cuFloatComplex* dev_matrix, cudaTextureObject
         unsigned int start_index = matrixStartIndexColumn(matrix_dim, blockDim.x, blockIdx.x, blockIdx.y, threadIdx.x);
         int end = std::min(matrix_dim - blockIdx.x * blockDim.x, blockDim.x);
         for (int i = 0; i < end; i++) {
-            int vectorPos = blockIdx.x * blockDim.x + i + (threadIdx.x + blockIdx.y * blockDim.x);
+            int vectorPos = (shift * (blockIdx.x * blockDim.x + i) + (threadIdx.x + blockIdx.y * blockDim.x)) % matrix_dim * 2;
             dev_matrix[start_index + i * matrix_dim].x += tex2D<float>(dev_vector, vectorPos, 0);
             dev_matrix[start_index + i * matrix_dim].y += tex2D<float>(dev_vector, vectorPos + 1, 0);
         }
@@ -77,8 +78,8 @@ private:
     cuFloatComplex* result;
     cuFloatComplex* dev_matrix;
     float** shift;
-    cudaTextureObject_t texObj = 0;
-    cudaArray* cuArray = 0;
+    cudaTextureObject_t* texObj = new cudaTextureObject_t();
+    cudaArray* *cuArray = new cudaArray * ();
     int iterations;
     long long duration;
 };
@@ -88,13 +89,20 @@ spift::spift(const int matrixDim, const int blockDim, const int iterations, cons
 
     cudaError_t cudaStatus;
 
-
-
-    cudaStatus = this->initTexture();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "GPU texture init failed: %s\n", cudaGetErrorString(cudaStatus));
-        return;
+    //allocate memory for shift vectors. testing only
+    std::uniform_real_distribution<> dist(0, 1);
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    this->shift = new float* [30];
+    for (int i = 0; i < 30; ++i) {
+        float* bla = new float[2 * matrixDim];
+        for (int x = 0; x < matrixDim * 2; ++x) {
+            bla[x] = x;
+            //bla[x] = dist(gen);
+        }
+        this->shift[i] = bla;
     }
+
 
     this->result = new cuFloatComplex[this->matrixDim * this->matrixDim];
     //allocate memory for result
@@ -104,25 +112,28 @@ spift::spift(const int matrixDim, const int blockDim, const int iterations, cons
         next.y = 0;
         this->result[x] = next;
     }
+
+
+
     cudaStatus = prepareGPU(GPU_index);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "GPU init failed: %s\n", cudaGetErrorString(cudaStatus));
         return;
     }
 
-    //allocate memory for shift vectors. testing only
-    std::uniform_real_distribution<> dist(0, 1);
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    this->shift = new float* [30];
-    for (int i = 0; i < 30; ++i) {
-        float* bla = new float[2 * matrixDim];
-        for (int x = 0; x < matrixDim * 2; ++x) {
-            bla[x] = 1.0f;
-            //bla[x] = dist(gen);
-        }
-        this->shift[i] = bla;
+    // Allocate CUDA array in device memory
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
+    cudaMallocArray(cuArray, &channelDesc, matrixDim * 2, 1);
+
+    cudaStatus = this->initTexture();
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "GPU texture init failed: %s\n", cudaGetErrorString(cudaStatus));
+        return;
     }
+
+    
+
+
 }
 
 
@@ -196,26 +207,23 @@ cudaError_t spift::iterate() {
 
 int spift::generateShift() {
     int x = std::rand() % 30;
-    cudaMemcpyToArray(cuArray, 0, 0, shift[x], matrixDim * 2 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpyToArray(*cuArray, 0, 0, shift[x], matrixDim * 2 * sizeof(float), cudaMemcpyHostToDevice);
     return std::rand() % 30;
 }
 
 cudaError spift::iteration() {
     int shift_length = generateShift();
-
     int nr_blocks = ceil((double)matrixDim / (double)this->blockDim);
     dim3* blockDim = new dim3(this->blockDim, 1);
     dim3* gridDim = new dim3(nr_blocks, nr_blocks);
-
-    updateWithColumnShift << <*gridDim, * blockDim >> > (dev_matrix, texObj, this->matrixDim, shift_length);
-    /*
+    
     if (std::rand() % 2) {
-        updateWithRowShift << <*gridDim, *blockDim >> > (dev_matrix, texObj, this->matrixDim, shift_length);
+        updateWithRowShift << <*gridDim, *blockDim >> > (dev_matrix, *texObj, this->matrixDim, shift_length);
     }
     else {
-        updateWithColumnShift << <*gridDim, *blockDim >> > (dev_matrix, texObj, this->matrixDim, shift_length);
+        updateWithColumnShift << <*gridDim, *blockDim >> > (dev_matrix, *texObj, this->matrixDim, shift_length);
     }
-    */
+    
 
     // Check for any errors launching the kernel
     auto cudaStatus = cudaGetLastError();
@@ -236,16 +244,13 @@ cudaError spift::iteration() {
 
 
 cudaError_t spift::initTexture() {
-    // Allocate CUDA array in device memory
-    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
-    cudaMallocArray(&(this->cuArray), &channelDesc, this->matrixDim * 2, 1);
+
 
     // Specify texture
     struct cudaResourceDesc resDesc;
     memset(&resDesc, 0, sizeof(resDesc));
     resDesc.resType = cudaResourceTypeArray;
-    resDesc.res.array.array = this->cuArray;
-
+    resDesc.res.array.array = *(this->cuArray);
     // Specify texture object parameters
     struct cudaTextureDesc texDesc;
     memset(&texDesc, 0, sizeof(texDesc));
@@ -256,11 +261,10 @@ cudaError_t spift::initTexture() {
     texDesc.normalizedCoords = 0;
 
     // Create texture object
-    cudaCreateTextureObject(&texObj, &resDesc, &texDesc, NULL);
+    cudaCreateTextureObject(texObj, &resDesc, &texDesc, NULL);
     auto cudaStatus = cudaGetLastError();
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "textureInit failed: %s\n", cudaGetErrorString(cudaStatus));
-        return cudaStatus;
     }
     return cudaSuccess;
 }
@@ -282,10 +286,10 @@ spift::~spift()
 
 
 void parallel(const int GPU_index, const int dim, std::ofstream *times) {
-    spift* tester = new spift(dim, 3, 2, GPU_index);
+    spift* tester = new spift(dim, 16, 100000, GPU_index);
     tester->iterate();
     *times << dim << "\t" << tester->displayTime() << "\t" << GPU_index << std::endl;
-    tester->printResult();
+    //tester->printResult();
     free(tester);
 }
 
@@ -293,15 +297,17 @@ void parallel(const int GPU_index, const int dim, std::ofstream *times) {
 
 int main()
 {
-    std::ofstream times;
-    times.open("timesGPU.txt");
-    parallel(1, 12, &times);
     /*
     std::ofstream times;
     times.open("timesGPU.txt");
+    parallel(1, 12, &times);
+    */
+    
+    std::ofstream times;
+    times.open("timesGPU.txt");
 
-    for (int i = 0; i < 7; i++) {
-        //std::thread t0(parallel, 0);
+    for (int i = 0; i < 6; i++) {
+        std::thread t0(parallel, 0, std::pow(2, i + 8), &times);
         std::thread t1(parallel, 1, std::pow(2, i + 8), &times);
         std::thread t2(parallel, 2, std::pow(2, i + 8), &times);
         std::thread t3(parallel, 3, std::pow(2, i + 8), &times);
@@ -309,14 +315,14 @@ int main()
         std::thread t5(parallel, 5, std::pow(2, i + 8), &times);
 
 
-        //t0.join();
+        t0.join();
         t1.join();
         t2.join();
         t3.join();
         t4.join();
         t5.join();
 
-        //std::thread t0(parallel, 0);
+        std::thread t00(parallel, 0, std::pow(2, i + 8), &times);
         std::thread t10(parallel, 1, std::pow(2, i + 8), &times);
         std::thread t20(parallel, 2, std::pow(2, i + 8), &times);
         std::thread t30(parallel, 3, std::pow(2, i + 8), &times);
@@ -324,13 +330,28 @@ int main()
         std::thread t50(parallel, 5, std::pow(2, i + 8), &times);
 
 
-        //t0.join();
+        t00.join();
         t10.join();
         t20.join();
         t30.join();
         t40.join();
         t50.join();
+
+        std::thread t000(parallel, 0, std::pow(2, i + 8), &times);
+        std::thread t100(parallel, 1, std::pow(2, i + 8), &times);
+        std::thread t200(parallel, 2, std::pow(2, i + 8), &times);
+        std::thread t300(parallel, 3, std::pow(2, i + 8), &times);
+        std::thread t400(parallel, 4, std::pow(2, i + 8), &times);
+        std::thread t500(parallel, 5, std::pow(2, i + 8), &times);
+
+
+        t000.join();
+        t100.join();
+        t200.join();
+        t300.join();
+        t400.join();
+        t500.join();
     }
-    */
+    
     return 0;
 }

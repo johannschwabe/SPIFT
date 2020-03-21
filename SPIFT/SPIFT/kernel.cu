@@ -66,6 +66,7 @@ class spift
 public:
     spift(const int matrixDim, const int blockDim, const int iterations, const int GPU_index);
     ~spift();
+    spift(const spift&) = delete;
     cudaError_t prepareGPU(int GPU_index);
     cudaError_t initTexture();
     cudaError_t iterate();
@@ -78,6 +79,7 @@ public:
     
     void getShiftVector(int i);
     void initShiftTest();
+    
     
 
 private:
@@ -116,7 +118,6 @@ private:
     int* coalescenceSet;
 
     std::mutex** shiftIndexMutex;
-    std::mutex* globalMutex;
 
     //boolean wheter execution is done
     int* done;
@@ -127,17 +128,13 @@ private:
 
 spift::spift(const int matrixDim, const int blockDim, const int iterations, const int GPU_index) : matrixDim(matrixDim), blockDim(blockDim), iterations(iterations)
 {
-    this->globalMutex = new std::mutex();
     cudaError_t cudaStatus;
 
     this->initResult();
-    std::cout << "here?" << std::endl;
 
     this->initCoalescence();
-    std::cout << "here??" << std::endl;
 
     this->initShiftTest();
-    std::cout << "here???" << std::endl;
 
 
     int nr_blocks = ceil((double)matrixDim / (double)this->blockDim);
@@ -244,6 +241,7 @@ void spift::printResult() {
 }
 
 void spift::generateShifts() {
+    int updates = 0;
     std::cout << "generating" << std::endl;
     std::uniform_real_distribution<> dist(0, 1);
     std::random_device rd;
@@ -252,28 +250,28 @@ void spift::generateShifts() {
         int posiCoal = (int)(dist(gen) * this->matrixDim * 2);
         int posiShift = (int)(dist(gen) * 200);
         this->shiftIndexMutex[posiCoal]->lock();
-        this->globalMutex->lock();
         if (this->coalescenceSet[posiCoal]) {
-            std::cout << "updating: " << posiCoal;
+            ++updates;
+            //std::cout << "updating: " << posiCoal << std::endl;
             for (int j = 0; j < this->matrixDim * 2; ++j) {
                 this->coalescence[posiCoal][j] += this->shift[posiShift][j];
             }
         }
         else {
-            std::cout << "first:    " << posiCoal;
+            //std::cout << "first:    " << posiCoal;
             for (int j = 0; j < this->matrixDim * 2; ++j) {
                 this->coalescence[posiCoal][j] = this->shift[posiShift][j];
             }
             this->coalescenceSet[posiCoal] = 1;
         }
-        std::cout << "\t-unlocking"<< std::endl;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        this->globalMutex->unlock();
+        //std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        //std::cout << "\t-unlocking" << std::endl;
+
         this->shiftIndexMutex[posiCoal]->unlock();
 
     }
     *(this->done) = 1;
-    std::cout << "generating done" << std::endl;
+    std::cout << "generating done, " << updates << " updates." << std::endl;
 }
 
 cudaError_t spift::iterate() {
@@ -291,7 +289,6 @@ cudaError_t spift::iterate() {
         for (int shiftPos = 0; shiftPos < this->matrixDim * 2; ++shiftPos) {
             if (this->coalescenceSet[shiftPos]) {
                 if (this->shiftIndexMutex[shiftPos]->try_lock()) {
-                    this->globalMutex->lock();
                     this->coalescenceSet[shiftPos] = 0;
                     cudaStatus = iteration(shiftPos);
                     // Check for any errors in iteration
@@ -300,12 +297,6 @@ cudaError_t spift::iterate() {
                         return cudaStatus;
                     }
                 }
-                else {
-                    std::cout << shiftPos << " failed: Mutex" << std::endl;
-                }
-            }
-            else {
-                std::cout << shiftPos << " failed:" << this->coalescenceSet[shiftPos] << std::endl;
             }
         }
     }
@@ -341,22 +332,16 @@ cudaError_t spift::iterate() {
 }
 
 void spift::getShiftVector(int i) {
-    std::cout << "cpy: " << i << std::endl;
-    for (int j = 0; j < this->matrixDim * 2; ++j) {
-        std::cout << this->coalescence[i][j] << ", ";
-    }
-    std::cout << std::endl;
+
     auto cudaStatus = cudaMemcpyToArray(*cuArray, 0, 0, this->coalescence[i], matrixDim * 2 * sizeof(float), cudaMemcpyHostToDevice);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "updateWithRowShift launch failed: %s\n", cudaGetErrorString(cudaStatus));
     }
-    std::cout << " -done" << std::endl;
 
 }
 
 cudaError spift::iteration(int shift) {
     getShiftVector(shift);
-    std::cout << "launching with shift: " << shift;
     if (shift < this->matrixDim / 2) {
         updateWithRowShift << <*gridDim3, *blockDim3 >> > (dev_matrix, *texObj, this->matrixDim, shift);
     }
@@ -378,9 +363,7 @@ cudaError spift::iteration(int shift) {
         fprintf(stderr, "cudaDeviceSynchronize returned error code %d: %s after launching Kernel!\n", cudaStatus, cudaGetErrorString(cudaStatus));
         return cudaStatus;
     }
-    this->globalMutex->unlock();
     this->shiftIndexMutex[shift]->unlock();
-    std::cout << " --Done: " << std::endl;
     return cudaSuccess;
 }
 
@@ -435,7 +418,7 @@ spift::~spift()
 
 
 void parallel(const int GPU_index, const int dim, std::ofstream *times) {
-    spift* tester = new spift(dim, 12, 1000, GPU_index);
+    spift* tester = new spift(dim, 16, 100000, GPU_index);
     std::cout << "inited" << std::endl;
     //tester->generateShifts();
     //tester->iterate();
@@ -455,7 +438,7 @@ int main()
     
     std::ofstream times;
     times.open("timesGPU.txt");
-    parallel(1, 12, &times);
+    parallel(0, 2048, &times);
     
     /*
     std::ofstream times;

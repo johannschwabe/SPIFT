@@ -64,10 +64,10 @@ __global__ void updateWithColumnShift(cuFloatComplex* dev_matrix, cudaTextureObj
 class spift
 {
 public:
-    spift(const int matrixDim, const int blockDim, const int iterations, const int GPU_index);
+    spift(const int matrixDim, const int blockDim, const int iterations, const int GPU_index, const int wait);
     ~spift();
     spift(const spift&) = delete;
-    cudaError_t prepareGPU(int GPU_index);
+    cudaError_t prepareGPU();
     cudaError_t initTexture();
     cudaError_t iterate();
     cudaError_t iteration(int shift);
@@ -122,11 +122,15 @@ private:
     //boolean wheter execution is done
     int* done;
 
+    int wait;
+
+    const int GPUIndex;
+
 
 
 };
 
-spift::spift(const int matrixDim, const int blockDim, const int iterations, const int GPU_index) : matrixDim(matrixDim), blockDim(blockDim), iterations(iterations)
+spift::spift(const int matrixDim, const int blockDim, const int iterations, const int GPU_index, const int wait) : matrixDim(matrixDim), blockDim(blockDim), iterations(iterations), GPUIndex(GPU_index), wait(wait)
 {
     cudaError_t cudaStatus;
 
@@ -141,7 +145,7 @@ spift::spift(const int matrixDim, const int blockDim, const int iterations, cons
     this->blockDim3 = new dim3(this->blockDim, 1);;
     this->gridDim3 = new dim3(nr_blocks, nr_blocks);;
 
-    cudaStatus = prepareGPU(GPU_index);
+    cudaStatus = prepareGPU();
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "GPU init failed: %s\n", cudaGetErrorString(cudaStatus));
         return;
@@ -186,30 +190,31 @@ void spift::initCoalescence()
 
 void spift::initShiftTest() {
     //allocate memory for shift vectors. testing only
-    std::uniform_real_distribution<> dist(0, 1);
+    std::uniform_real_distribution<> dist(-1, 1);
     std::random_device rd;
     std::mt19937 gen(rd());
     this->shift = new float* [200];
     for (int i = 0; i < 200; ++i) {
         float* bla = new float[2 * matrixDim];
         for (int x = 0; x < matrixDim * 2; ++x) {
-            bla[x] = x;
-            //bla[x] = dist(gen);
+            //bla[x] = x;
+            bla[x] = dist(gen);
         }
         this->shift[i] = bla;
     }
 }
 
-cudaError_t spift::prepareGPU(int GPU_index) {
+cudaError_t spift::prepareGPU() {
     cudaError_t cudaStatus;
 
     // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(GPU_index);
+    cudaStatus = cudaSetDevice(this->GPUIndex);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
         return cudaStatus;
     }
     // Allocate GPU buffers for matrix
+    cudaStatus = cudaSetDevice(this->GPUIndex);
     cudaStatus = cudaMalloc((void**)&(this->dev_matrix), this->matrixDim * this->matrixDim * sizeof(cuFloatComplex));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed!");
@@ -217,6 +222,7 @@ cudaError_t spift::prepareGPU(int GPU_index) {
     }
 
     // Copy input Matrix from host memory to GPU buffers.
+    cudaStatus = cudaSetDevice(this->GPUIndex);
     cudaStatus = cudaMemcpy((this->dev_matrix), (this->result), this->matrixDim * this->matrixDim * sizeof(cuFloatComplex), cudaMemcpyHostToDevice);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy failed!");
@@ -226,7 +232,7 @@ cudaError_t spift::prepareGPU(int GPU_index) {
 }
 
 auto spift::displayTime() {
-    std::cout << "terminated " << iterations << "  " << matrixDim << " dim, time: " << duration << "ms" << std::endl;
+    std::cout << "terminated " << iterations << " iterations,  " << matrixDim << " dim, time: " << duration << "ms waitTime: " << this->wait << " micro seconds" << std::endl;
     std::cout << "time per iteration: " << duration / (double)iterations << std::endl;
     return duration;
 }
@@ -242,7 +248,6 @@ void spift::printResult() {
 
 void spift::generateShifts() {
     int updates = 0;
-    std::cout << "generating" << std::endl;
     std::uniform_real_distribution<> dist(0, 1);
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -264,14 +269,13 @@ void spift::generateShifts() {
             }
             this->coalescenceSet[posiCoal] = 1;
         }
-        //std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::microseconds(this->wait));
         //std::cout << "\t-unlocking" << std::endl;
 
         this->shiftIndexMutex[posiCoal]->unlock();
 
     }
     *(this->done) = 1;
-    std::cout << "generating done, " << updates << " updates." << std::endl;
 }
 
 cudaError_t spift::iterate() {
@@ -282,7 +286,6 @@ cudaError_t spift::iterate() {
     */
 
     cudaError_t cudaStatus;
-    std::cout << "iterating" << std::endl;
     auto t1 = std::chrono::high_resolution_clock::now();
     while(!*done) {
         //std::cout << "done: " << *done << std::endl;
@@ -300,7 +303,6 @@ cudaError_t spift::iterate() {
             }
         }
     }
-    std::cout << "last round: " << std::endl;
     for (int shiftPos = 0; shiftPos < this->matrixDim * 2; ++shiftPos) {
         if (this->coalescenceSet[shiftPos]) {
             if (this->shiftIndexMutex[shiftPos]->try_lock()) {
@@ -312,9 +314,6 @@ cudaError_t spift::iterate() {
                     return cudaStatus;
                 }
             }
-        }
-        else {
-            //std::cout << shiftPos << " failed:" << this->coalescenceSet[shiftPos] << std::endl;
         }
     }
 
@@ -332,7 +331,7 @@ cudaError_t spift::iterate() {
 }
 
 void spift::getShiftVector(int i) {
-
+    cudaSetDevice(this->GPUIndex);
     auto cudaStatus = cudaMemcpyToArray(*cuArray, 0, 0, this->coalescence[i], matrixDim * 2 * sizeof(float), cudaMemcpyHostToDevice);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "updateWithRowShift launch failed: %s\n", cudaGetErrorString(cudaStatus));
@@ -342,6 +341,7 @@ void spift::getShiftVector(int i) {
 
 cudaError spift::iteration(int shift) {
     getShiftVector(shift);
+    cudaSetDevice(this->GPUIndex);
     if (shift < this->matrixDim / 2) {
         updateWithRowShift << <*gridDim3, *blockDim3 >> > (dev_matrix, *texObj, this->matrixDim, shift);
     }
@@ -358,6 +358,7 @@ cudaError spift::iteration(int shift) {
 
     // cudaDeviceSynchronize waits for the kernel to finish, and returns
     // any errors encountered during the launch.
+    cudaStatus = cudaSetDevice(this->GPUIndex);
     cudaStatus = cudaDeviceSynchronize();
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaDeviceSynchronize returned error code %d: %s after launching Kernel!\n", cudaStatus, cudaGetErrorString(cudaStatus));
@@ -386,6 +387,7 @@ cudaError_t spift::initTexture() {
     texDesc.normalizedCoords = 0;
 
     // Create texture object
+    cudaSetDevice(this->GPUIndex);
     cudaCreateTextureObject(texObj, &resDesc, &texDesc, NULL);
     auto cudaStatus = cudaGetLastError();
     if (cudaStatus != cudaSuccess) {
@@ -401,13 +403,15 @@ spift::~spift()
     for (int i = 0; i < 200; ++i) {
         free(this->shift[i]);
     }
-    
+   
     free(this->shift);
+    cudaSetDevice(this->GPUIndex);
+    cudaFree(this->dev_matrix);
+    cudaFreeArray(*(this->cuArray));
     cudaError cudaStatus = cudaDeviceReset();
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaDeviceReset failed!");
     }
-    free(this->coalescenceSet);
     for (int i = 0; i < matrixDim * 2; ++i) {
         free(this->coalescence[i]);
     }
@@ -417,8 +421,8 @@ spift::~spift()
 
 
 
-void parallel(const int GPU_index, const int dim, std::ofstream *times) {
-    spift* tester = new spift(dim, 16, 100000, GPU_index);
+void parallel(const int GPU_index, const int dim, std::ofstream *times, const int wait, std::mutex* writeMutex) {
+    spift* tester = new spift(dim, 16, 100000, GPU_index, wait);
     std::cout << "inited" << std::endl;
     //tester->generateShifts();
     //tester->iterate();
@@ -426,71 +430,77 @@ void parallel(const int GPU_index, const int dim, std::ofstream *times) {
     std::thread iter(&spift::iterate, tester);
     shifts.join();
     iter.join();
-    *times << dim << "\t" << tester->displayTime() << "\t" << GPU_index << std::endl;
+    writeMutex->lock();
+    *times << dim << "\t" << wait << "\t" << tester->displayTime() << "\t" << GPU_index << std::endl;
     //tester->printResult();
-    free(tester);
+    writeMutex->unlock();
+    delete tester;
+
 }
 
 
 
 int main()
 {
-    
-    std::ofstream times;
-    times.open("timesGPU.txt");
-    parallel(0, 2048, &times);
-    
     /*
     std::ofstream times;
     times.open("timesGPU.txt");
-
-    for (int i = 0; i < 6; i++) {
-        std::thread t0(parallel, 0, std::pow(2, i + 8), &times);
-        std::thread t1(parallel, 1, std::pow(2, i + 8), &times);
-        std::thread t2(parallel, 2, std::pow(2, i + 8), &times);
-        std::thread t3(parallel, 3, std::pow(2, i + 8), &times);
-        std::thread t4(parallel, 4, std::pow(2, i + 8), &times);
-        std::thread t5(parallel, 5, std::pow(2, i + 8), &times);
-
-
-        t0.join();
-        t1.join();
-        t2.join();
-        t3.join();
-        t4.join();
-        t5.join();
-
-        std::thread t00(parallel, 0, std::pow(2, i + 8), &times);
-        std::thread t10(parallel, 1, std::pow(2, i + 8), &times);
-        std::thread t20(parallel, 2, std::pow(2, i + 8), &times);
-        std::thread t30(parallel, 3, std::pow(2, i + 8), &times);
-        std::thread t40(parallel, 4, std::pow(2, i + 8), &times);
-        std::thread t50(parallel, 5, std::pow(2, i + 8), &times);
-
-
-        t00.join();
-        t10.join();
-        t20.join();
-        t30.join();
-        t40.join();
-        t50.join();
-
-        std::thread t000(parallel, 0, std::pow(2, i + 8), &times);
-        std::thread t100(parallel, 1, std::pow(2, i + 8), &times);
-        std::thread t200(parallel, 2, std::pow(2, i + 8), &times);
-        std::thread t300(parallel, 3, std::pow(2, i + 8), &times);
-        std::thread t400(parallel, 4, std::pow(2, i + 8), &times);
-        std::thread t500(parallel, 5, std::pow(2, i + 8), &times);
-
-
-        t000.join();
-        t100.join();
-        t200.join();
-        t300.join();
-        t400.join();
-        t500.join();
-    }
+    parallel(1, 4096, &times, 5);
     */
+    auto writeMutex = new std::mutex();
+    std::ofstream times;
+    times.open("timesGPU.txt");
+    for (int j = 0; j < 5; ++j) {
+        for (int i = 0; i < 20; i++) {
+            std::thread t0(parallel, 0, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t1(parallel, 1, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t2(parallel, 2, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t3(parallel, 3, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t4(parallel, 4, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t5(parallel, 5, pow(2, j + 9), &times, 5 * i, writeMutex);
+
+
+            t0.join();
+            t1.join();
+            t2.join();
+            t3.join();
+            t4.join();
+            t5.join();
+
+            std::thread t00(parallel, 0, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t10(parallel, 1, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t20(parallel, 2, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t30(parallel, 3, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t40(parallel, 4, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t50(parallel, 5, pow(2, j + 9), &times, 5 * i, writeMutex);
+
+
+            t00.join();
+            t10.join();
+            t20.join();
+            t30.join();
+            t40.join();
+            t50.join();
+
+            std::thread t000(parallel, 0, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t100(parallel, 1, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t200(parallel, 2, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t300(parallel, 3, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t400(parallel, 4, pow(2, j + 9), &times, 5 * i, writeMutex);
+            std::thread t500(parallel, 5, pow(2, j + 9), &times, 5 * i, writeMutex);
+
+
+            t000.join();
+            t100.join();
+            t200.join();
+            t300.join();
+            t400.join();
+            t500.join();
+        }
+    }
+    
+    
+    
     
     return 0;
 }

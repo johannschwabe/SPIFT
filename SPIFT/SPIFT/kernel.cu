@@ -93,6 +93,7 @@ public:
     void initTwiddle();
     auto displayTime();
     void printResult();
+    bool testResult(std::string original);
     void generateShifts();
     void initResult();
     void initCoalescence();
@@ -251,6 +252,16 @@ void spift::printResult() {
         }
         std::cout << std::endl;
     }
+}
+bool spift::testResult(std::string original){
+    std::ifstream originalFile(original);
+    dataPoint point;
+    while (originalFile >> point) {
+        if (this->result[point.u * matrixDim + point.v].x != point.vis.real || this->result[point.u * matrixDim + point.v].y != point.vis.imag) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void spift::generateShifts() {

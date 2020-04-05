@@ -501,7 +501,7 @@ spift::~spift()
 
 
 void parallel(const int GPU_index, const int dim, std::ofstream *times, std::mutex* writeMutex, std::string fileName) {
-    spift* tester = new spift(dim, 16, 100000, GPU_index,  fileName);
+    spift* tester = new spift(dim, 8, 100000, GPU_index,  fileName);
     std::cout << "inited" << std::endl;
     //tester->generateShifts();
     //tester->iterate();
@@ -534,7 +534,7 @@ int main()
     auto writeMutex = new std::mutex();
     std::ofstream times;
     times.open("timesGPU.txt");
-    parallel(1, 256, &times, writeMutex, "testData.txt");
+    parallel(1, 8, &times, writeMutex, "testData.txt");
     std::cout << "done3" << std::endl;
    
     /*

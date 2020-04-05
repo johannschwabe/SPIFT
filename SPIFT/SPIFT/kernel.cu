@@ -5,6 +5,7 @@
 
 #include <stdio.h>
 #include <algorithm>
+#include <numeric>
 #include <iostream>
 #include <iomanip>
 #include <chrono>
@@ -15,7 +16,6 @@
 #include <mutex>
 #include <thread>
 #include <complex>
-
 struct dataPoint
 {
     int u;
@@ -23,10 +23,15 @@ struct dataPoint
     std::complex<float> vis;
 };
 
-std::istream& operator>>(std::ifstream& input, struct dataPoint data) {
-    input >> data.u;
-    input >> data.v;
-    input >> data.vis;
+std::istream& operator>>(std::ifstream& input, struct dataPoint* data) {
+    char x;
+    input >> data->u;
+    input >> x;
+    if (x != ',') { input.setstate(std::ios_base::failbit); }
+    input >> data->v;
+    input >> x;
+    if (x != ',') { input.setstate(std::ios_base::failbit); }
+    input >> data->vis;
     return input;
 }
 
@@ -164,6 +169,7 @@ spift::spift(const int matrixDim, const int blockDim, const int iterations, cons
 
     this->inputStream = new std::ifstream(fileName);
 
+
     int nr_blocks = ceil((double)matrixDim / (double)this->blockDim);
     this->blockDim3 = new dim3(this->blockDim, 1);;
     this->gridDim3 = new dim3(nr_blocks, nr_blocks);;
@@ -255,18 +261,27 @@ void spift::printResult() {
 }
 bool spift::testResult(std::string original){
     std::ifstream originalFile(original);
-    dataPoint point;
-    while (originalFile >> point) {
-        if (this->result[point.u * matrixDim + point.v].x != point.vis.real || this->result[point.u * matrixDim + point.v].y != point.vis.imag) {
-            return false;
+    std::ofstream myRes("spiftRes.txt");
+    int pos;
+    for (int i = 0; i < this->matrixDim; ++i) {
+        for (int j = 0; j < this->matrixDim; ++j) {
+            originalFile >> pos;
+            std::cout << pos << " - (" << this->result[this->matrixDim * i + j].x << ", " << this->result[this->matrixDim * i + j].y << ")" << std::endl;
+            myRes << this->result[this->matrixDim * i + j].x << ", " << this->result[this->matrixDim * i + j].y << "\t";
+            /*if (this->result[this->matrixDim * i + j].x != std::abs(pos - 255)) {
+            }*/
+            
         }
+        myRes << std::endl;
     }
+    myRes.close();
     return true;
 }
 
 void spift::generateShifts() {
     struct dataPoint next;
-    while(*(this->inputStream)>>next) {
+
+    while(*(this->inputStream)>>&next) {
         int posiCoal;
         bool isRowShift = this->shiftType(next.u, next.v);
         int shiftIdx = this->shiftIndex(next.u, next.v, isRowShift);
@@ -298,7 +313,6 @@ cudaError_t spift::iterate() {
     - this->coalescenceSet
     - this->coalescence
     */
-
     cudaError_t cudaStatus;
     auto t1 = std::chrono::high_resolution_clock::now();
     while(!*done) {
@@ -317,6 +331,7 @@ cudaError_t spift::iterate() {
             }
         }
     }
+    std::cout << "done" << std::endl;
     for (int shiftPos = 0; shiftPos < this->matrixDim * 2; ++shiftPos) {
         if (this->coalescenceSet[shiftPos]) {
             if (this->shiftIndexMutex[shiftPos]->try_lock()) {
@@ -411,12 +426,15 @@ cudaError_t spift::initTexture() {
 }
 
 bool spift::shiftType(int u, int v) {       //true: RowShift,   false: ColumnShift
-    return !(v == 0 || ((u % 2) && !(v % 2)) || floor(std::log2(v)) == std::log2(v));
+    return !(v == 0 || ((u % 2) && !(v % 2)) || (std::__gcd(u,this->matrixDim) < std::__gcd(v, this->matrixDim)) && v % 2 == 0);
 }
 
 int spift::shiftIndex(int u, int v, bool isRowShift) {
     int uk;
     int vk;
+    if (u == 0 || v == 0) {
+        return 0;
+    }
     if (isRowShift) {
         uk = u;
         vk = v;
@@ -426,12 +444,13 @@ int spift::shiftIndex(int u, int v, bool isRowShift) {
         uk = v;
         vk = u;
     }
-    for (int j = 0; j < this->matrixDim; ++j) {
+    for (int j = 0; j <= this->matrixDim; ++j) {
         if (uk == (j * vk) % this->matrixDim) {
             return j;
         }
     }
-    throw "ERRRORRRR";
+    std::cout << u << ", " << v << ", " << isRowShift << std::endl;
+    throw 15;
 }
 
 float* spift::computeShift(int u, int v, std::complex<float> vis, bool isRowShift) {
@@ -452,7 +471,9 @@ void spift::initTwiddle() {
     for(int k = 0; k < this->matrixDim; ++k){
         std::complex<float> next = std::exp(std::complex<float>(0, k * 2 * M_PI / this->matrixDim));
         this->twiddleFactors[k] = next;
+        //std::cout << next << ", ";
     }
+    //std::cout << std::endl;
 }
 
 spift::~spift()
@@ -490,6 +511,14 @@ void parallel(const int GPU_index, const int dim, std::ofstream *times, std::mut
     iter.join();
     writeMutex->lock();
     *times << dim << "\t" << "\t" << tester->displayTime() << "\t" << GPU_index << std::endl;
+    if (tester->testResult("originalData.txt")) {
+        std::cout << "success" << std::endl;
+    }
+    else
+    {
+        std::cout << "failed" << std::endl;
+    }
+    
     //tester->printResult();
 
     writeMutex->unlock();
@@ -502,11 +531,10 @@ void parallel(const int GPU_index, const int dim, std::ofstream *times, std::mut
 
 int main()
 {
-
     auto writeMutex = new std::mutex();
     std::ofstream times;
     times.open("timesGPU.txt");
-    parallel(1, 4096, &times, writeMutex, "testData.txt");
+    parallel(1, 256, &times, writeMutex, "testData.txt");
     std::cout << "done3" << std::endl;
    
     /*

@@ -89,18 +89,30 @@ __global__ void divideN2(cuFloatComplex* dev_matrix, const int matrix_dim) {
     }
 }
 
+__global__ void sumResults(cuFloatComplex* source, cuFloatComplex* target, const int matrix_dim) {
+    if (blockIdx.x * blockDim.x + threadIdx.x < matrix_dim) {
+        unsigned int start_index = matrixStartIndexColumn(matrix_dim, blockDim.x, blockIdx.x, blockIdx.y, threadIdx.x);
+        int end = std::min(matrix_dim - blockIdx.x * blockDim.x, blockDim.x);
+        for (int i = 0; i < end; i++) {
+            target[start_index + i * matrix_dim].x += source[start_index + i * matrix_dim].x;
+            target[start_index + i * matrix_dim].y += source[start_index + i * matrix_dim].y;
+        }
+    }
+}
+
 
 class spift
 {
 public:
-    spift(const int matrixDim, const int blockDim, const int iterations, const int GPU_index, std::string fileName);
+    spift(const int matrixDim, const int blockDim, const int GPU_index[], const int nrGPUs, std::string fileName);
     ~spift();
     spift(const spift&) = delete;
-    cudaError_t prepareGPU();
-    cudaError_t initTexture();
-    cudaError_t iterate();
-    cudaError_t iteration(int shift);
-    cudaError_t getResult();
+    cudaError_t prepareGPU(int pos);
+    cudaError_t initTexture(int pos);
+    cudaError_t iterate(int pos, int start, int end);
+    cudaError_t iteration(int shift, int pos);
+    void splitIteration();
+    cudaError_t getResult(int pos);
     bool shiftType(int u, int v);
     int shiftIndex(int u, int v, bool isRowShift);
     float* computeShift(int u, int v, std::complex<float> vis, bool isRowShift);
@@ -109,10 +121,12 @@ public:
     void printResult();
     bool testResult(std::string original);
     void generateShifts();
+    cudaError combine2Cards(int card1, int card2);
+    cudaError aggregateResult();
     void initResult();
     void initCoalescence();
     
-    void getShiftVector(int i);
+    void getShiftVector(int i, int pos);
     
     
 
@@ -128,17 +142,15 @@ private:
     cuFloatComplex* result;
 
     //the device-matrix, where the current state is saved
-    cuFloatComplex* dev_matrix;
+    cuFloatComplex** dev_matrix;
 
 
     //the texture object where the current shift is saved during kernel execution
-    cudaTextureObject_t* texObj = new cudaTextureObject_t();
+    cudaTextureObject_t** texObj = new cudaTextureObject_t*();
 
     //the data in texobj
-    cudaArray* *cuArray = new cudaArray * ();
+    cudaArray** *cuArray;
 
-    //the number of iterations, testing only
-    int iterations;
 
     //measuring the execution time
     long long duration;
@@ -156,7 +168,9 @@ private:
 
 
     //the Index of the GPU on which it is executed
-    const int GPUIndex;
+    int *GPUIndex;
+
+    const int nrGPUS;
 
     //the precomputed twiddleFactors
     std::complex<float>* twiddleFactors;
@@ -166,38 +180,39 @@ private:
 
 };
 
-spift::spift(const int matrixDim, const int blockDim, const int iterations, const int GPU_index, std::string fileName) : matrixDim(matrixDim), blockDim(blockDim), iterations(iterations), GPUIndex(GPU_index)
+spift::spift(const int matrixDim, const int blockDim, const int GPU_index[], const int nrGPUs, std::string fileName) : matrixDim(matrixDim), blockDim(blockDim), nrGPUS(nrGPUs)
 {
+    this->initResult();
+    this->initCoalescence();
+    this->initTwiddle();
+    this->inputStream = new std::ifstream(fileName);
+    int nr_blocks = ceil((double)matrixDim / (double)this->blockDim);
+    this->blockDim3 = new dim3(this->blockDim, 1);
+    this->gridDim3 = new dim3(nr_blocks, nr_blocks);
+
     cudaError_t cudaStatus;
 
-    this->initResult();
+    this->dev_matrix = new cuFloatComplex * [nrGPUs];
+    this->cuArray = new cudaArray** [nrGPUs];
+    this->texObj = new cudaTextureObject_t*[nrGPUs];
 
-    this->initCoalescence();
+    this->GPUIndex = new int[nrGPUs];
+    for (int i = 0; i < nrGPUs; ++i) {
+        this->GPUIndex[i] = GPU_index[i];
+        cudaStatus = prepareGPU(i);
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "GPU init failed: %s\n", cudaGetErrorString(cudaStatus));
+            return;
+        }
 
-    this->initTwiddle();
-
-    this->inputStream = new std::ifstream(fileName);
-
-
-    int nr_blocks = ceil((double)matrixDim / (double)this->blockDim);
-    this->blockDim3 = new dim3(this->blockDim, 1);;
-    this->gridDim3 = new dim3(nr_blocks, nr_blocks);;
-
-    cudaStatus = prepareGPU();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "GPU init failed: %s\n", cudaGetErrorString(cudaStatus));
-        return;
+        cudaStatus = this->initTexture(i);
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "GPU texture init failed: %s\n", cudaGetErrorString(cudaStatus));
+            return;
+        }
     }
 
-    // Allocate CUDA array in device memory
-    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
-    cudaMallocArray(cuArray, &channelDesc, matrixDim * 2, 1);
 
-    cudaStatus = this->initTexture();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "GPU texture init failed: %s\n", cudaGetErrorString(cudaStatus));
-        return;
-    }
 
 }
 
@@ -227,36 +242,38 @@ void spift::initCoalescence()
 }
 
 
-cudaError_t spift::prepareGPU() {
+cudaError_t spift::prepareGPU(int pos) {
     cudaError_t cudaStatus;
 
     // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(this->GPUIndex);
+    cudaStatus = cudaSetDevice(this->GPUIndex[pos]);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
         return cudaStatus;
     }
     // Allocate GPU buffers for matrix
-    cudaStatus = cudaSetDevice(this->GPUIndex);
-    cudaStatus = cudaMalloc((void**)&(this->dev_matrix), this->matrixDim * this->matrixDim * sizeof(cuFloatComplex));
+    cudaStatus = cudaMalloc((void**)&(this->dev_matrix[pos]), this->matrixDim * this->matrixDim * sizeof(cuFloatComplex));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed!");
         return cudaStatus;
     }
 
     // Copy input Matrix from host memory to GPU buffers.
-    cudaStatus = cudaSetDevice(this->GPUIndex);
-    cudaStatus = cudaMemcpy((this->dev_matrix), (this->result), this->matrixDim * this->matrixDim * sizeof(cuFloatComplex), cudaMemcpyHostToDevice);
+    cudaStatus = cudaSetDevice(this->GPUIndex[pos]);
+    cudaStatus = cudaMemcpy((this->dev_matrix[pos]), this->result, this->matrixDim * this->matrixDim * sizeof(cuFloatComplex), cudaMemcpyHostToDevice);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy failed!");
         return cudaStatus;
     }
+    // Allocate CUDA array in device memory
+    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
+    cudaMallocArray(cuArray[pos], &channelDesc, matrixDim * 2, 1);
+
     return cudaSuccess;
 }
 
 auto spift::displayTime() {
-    std::cout << "terminated " << iterations << " iterations,  " << matrixDim << " dim, time: " << duration;
-    std::cout << " time per iteration: " << duration / (double)iterations << std::endl;
+    std::cout << "terminated " << matrixDim << " dim, time: " << duration;
     return duration;
 }
 
@@ -271,24 +288,18 @@ void spift::printResult() {
 bool spift::testResult(std::string original){
     std::cout << "Dim: " << this->matrixDim << std::endl;
     std::ifstream originalFile(original);
-    //std::ofstream myRes("spiftRes.txt");
     double pos;
     int count = 0;
     for (int i = 0; i < this->matrixDim; ++i) {
         for (int j = 0; j < this->matrixDim; ++j) {
             originalFile >> pos;
-            //std::cout << pos << " - (" << std::roundf(this->result[this->matrixDim * i + j].x * 100)/100 << ", " << std::roundf(this->result[this->matrixDim * i + j].y * 100) / 100 << ")" << std::endl;
-            //myRes << this->result[this->matrixDim * i + j].x << ", " << this->result[this->matrixDim * i + j].y << "\t";
             if (abs(this->result[this->matrixDim * i + j].x - pos) > 0.0001 || abs(this->result[this->matrixDim * i + j].y) > 0.0001) {
-                //std::cout << "Diff: " << this->result[this->matrixDim * i + j].x - pos << ",\t imaginary: " << abs(this->result[this->matrixDim * i + j].y) <<",\t Pos: " << i << ", " << j<< std::endl;
                 count++;
             }
             
         }
-        //myRes << std::endl;
     }
     std::cout << this->matrixDim * this->matrixDim << ", " << count << std::endl;
-    //myRes.close();
     return true;
 }
 
@@ -296,7 +307,6 @@ void spift::generateShifts() {
     struct dataPoint next;
 
     while(*(this->inputStream)>>&next) {
-        //std::cout << "u: " << next.u << ", v: " << next.v << ", vis: " << next.vis << std::endl;
         int posiCoal;
         bool isRowShift = this->shiftType(next.u, next.v);
         int shiftIdx = this->shiftIndex(next.u, next.v, isRowShift);
@@ -304,14 +314,7 @@ void spift::generateShifts() {
         
         if (isRowShift) { posiCoal = shiftIdx; }
         else { posiCoal = shiftIdx + this->matrixDim; }
-        /*
-        std::cout << "shiftIndex: " << shiftIdx << ", rowshift: " << isRowShift << "\t";
-        for (int i = 0; i < this->matrixDim; ++i) {
-            std::cout << "(" << std::setfill(' ') << std::setw(5) << std::roundf(vector[i * 2] *100) / 100 << ", " << std::setfill(' ') << std::setw(5) << std::roundf(vector[i * 2 + 1] * 100) / 100 << ")\t";
-        }
-        std::cout << std::endl;
-        std::cout << std::endl;
-        */
+        
         this->shiftIndexMutex[posiCoal]->lock();
         if (this->coalescenceSet[posiCoal]) {
             for (int j = 0; j < this->matrixDim * 2; ++j) {
@@ -331,15 +334,69 @@ void spift::generateShifts() {
     *(this->done) = 1;
 }
 
-cudaError_t spift::iterate() {
-    cudaError_t cudaStatus = cudaSuccess;
+cudaError spift::combine2Cards(int sourceCard, int targetCard) {
+    cuFloatComplex* temp;
+    cudaSetDevice(this->GPUIndex[targetCard]);
+    auto cudaStatus = cudaMalloc((void**)&temp, this->matrixDim * this->matrixDim * sizeof(cuFloatComplex));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "Malloc for combine2Cards failed: %s\n", cudaGetErrorString(cudaStatus));
+        return cudaStatus;
+    }
+    cudaStatus = cudaMemcpyPeer(temp, this->GPUIndex[targetCard], this->dev_matrix[sourceCard], this->GPUIndex[sourceCard], this->matrixDim * this->matrixDim * sizeof(cuFloatComplex));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "Memcpy for combine2Cards failed: %s\n", cudaGetErrorString(cudaStatus));
+        return cudaStatus;
+    }
+    cudaSetDevice(this->GPUIndex[targetCard]);
+    sumResults << <*gridDim3, * blockDim3 >> > (this->dev_matrix[card2], temp, this->matrixDim);
+    cudaDeviceSynchronize();
+    cudaStatus = cudaGetLastError();
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "sumResults launch failed: %s\n", cudaGetErrorString(cudaStatus));
+        return cudaStatus;
+    }
+    cudaFree(temp);
+    return cudaSuccess;
+}
+
+cudaError spift::aggregateResult() {
+    cudaError cudaStatus;
+    for (int i = 2; i < this->nrGPUS; ++i) {
+        cudaStatus = this->combine2Cards(i - 1, i);
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "Memcpy for combine2Cards failed: %s\n", cudaGetErrorString(cudaStatus));
+            return cudaStatus;
+        }
+    }
+    return getResult(this->nrGPUS);
+    
+}
+
+void spift::splitIteration() {
     auto t1 = std::chrono::high_resolution_clock::now();
+    std::thread** threads = new std::thread*[this->nrGPUS];
+    for (int i = 0; i < this->nrGPUS; ++i) {
+        threads[i] = new std::thread(&spift::iterate, this, i, floor(this->matrixDim * 2 / this->nrGPUS * i), floor(this->matrixDim * 2 / this->nrGPUS * (i+1)));
+    }
+    for (int i = 0; i < this->nrGPUS; ++i) {
+        threads[i]->join();
+    }
+    auto t2 = std::chrono::high_resolution_clock::now();
+    this->duration = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    //toDo Launch combination kernel; 
+    auto cudaStatus = this->getResult(this->nrGPUS);
+
+}
+
+cudaError_t spift::iterate(int pos, int start, int end) {
+    cudaError_t cudaStatus = cudaSuccess;
+    
     while(!*done) {
-        for (int shiftPos = 0; shiftPos < this->matrixDim * 2; ++shiftPos) {
+        for (int shiftPos = start; shiftPos < end; ++shiftPos) {
             if (this->coalescenceSet[shiftPos]) {
                 if (this->shiftIndexMutex[shiftPos]->try_lock()) {
                     this->coalescenceSet[shiftPos] = 0;
-                    cudaStatus = iteration(shiftPos);
+                    cudaStatus = iteration(shiftPos, pos);
                     // Check for any errors in iteration
                     if (cudaStatus != cudaSuccess) {
                         fprintf(stderr, "iteration %d failed: %s\n", shiftPos, cudaGetErrorString(cudaStatus));
@@ -349,11 +406,11 @@ cudaError_t spift::iterate() {
             }
         }
     }
-    for (int shiftPos = 0; shiftPos < this->matrixDim * 2; ++shiftPos) {
+    for (int shiftPos = start; shiftPos < end; ++shiftPos) {
         if (this->coalescenceSet[shiftPos]) {
             if (this->shiftIndexMutex[shiftPos]->try_lock()) {
                 this->coalescenceSet[shiftPos] = 0;
-                cudaStatus = iteration(shiftPos);
+                cudaStatus = iteration(shiftPos, pos);
                 // Check for any errors in iteration
                 if (cudaStatus != cudaSuccess) {
                     fprintf(stderr, "iteration %d failed: %s\n", shiftPos, cudaGetErrorString(cudaStatus));
@@ -362,21 +419,13 @@ cudaError_t spift::iterate() {
             }
         }
     }
-
-    auto t2 = std::chrono::high_resolution_clock::now();
-    this->duration = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-    
-    cudaStatus = this->getResult();
-    
-
-
     
     return cudaStatus;
 }
 
-cudaError_t spift::getResult() {
+cudaError_t spift::getResult(int pos) {
     // Copy output vector from GPU buffer to host memory.
-    auto cudaStatus = cudaSetDevice(this->GPUIndex);
+    auto cudaStatus = cudaSetDevice(this->GPUIndex[pos]);
     divideN2 << <*gridDim3, * blockDim3 >> > (dev_matrix, this->matrixDim);
     cudaStatus = cudaDeviceSynchronize();
     cudaStatus = cudaGetLastError();
@@ -390,41 +439,28 @@ cudaError_t spift::getResult() {
         return cudaStatus;
     }
 
-    //ToDo Kernel implementation needed
-    /*
-    for (int i = 0; i < this->matrixDim * this->matrixDim; ++i) {
-        this->result[i].x = this->result[i].x / (this->matrixDim * this->matrixDim);
-        this->result[i].y = this->result[i].y / (this->matrixDim * this->matrixDim);
-    }*/
     
     return cudaSuccess;
         
 }
 
-void spift::getShiftVector(int i) {
-    cudaSetDevice(this->GPUIndex);
-    auto cudaStatus = cudaMemcpyToArray(*cuArray, 0, 0, this->coalescence[i], matrixDim * 2 * sizeof(float), cudaMemcpyHostToDevice);
-    /*
-    std::cout << "shift: " << i << std::endl << "shiftVector:" <<std::endl;
-    for (int j = 0; j < this->matrixDim; ++j) {
-        std::cout << "(" << std::roundf(this->coalescence[i][2 * j] * 100) / 100 << ", " << std::roundf(this->coalescence[i][2 * j + 1] * 100) / 100 << "), ";
-    }
-    std::cout << std::endl;
-    */
+void spift::getShiftVector(int i, int pos) {
+    cudaSetDevice(this->GPUIndex[pos]);
+    auto cudaStatus = cudaMemcpyToArray(*cuArray[pos], 0, 0, this->coalescence[i], matrixDim * 2 * sizeof(float), cudaMemcpyHostToDevice);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "updateWithRowShift launch failed: %s\n", cudaGetErrorString(cudaStatus));
     }
 
 }
 
-cudaError spift::iteration(int shift) {
-    getShiftVector(shift);
-    cudaSetDevice(this->GPUIndex);
+cudaError spift::iteration(int shift, int pos) {
+    getShiftVector(shift, pos);
+    cudaSetDevice(this->GPUIndex[pos]);
     if (shift < this->matrixDim) {
-        updateWithRowShift << <*gridDim3, *blockDim3 >> > (dev_matrix, *texObj, this->matrixDim, shift);
+        updateWithRowShift << <*gridDim3, *blockDim3 >> > (dev_matrix[pos], *texObj[pos], this->matrixDim, shift);
     }
     else {
-        updateWithColumnShift << <*gridDim3, *blockDim3 >> > (dev_matrix, *texObj, this->matrixDim, shift - this->matrixDim);
+        updateWithColumnShift << <*gridDim3, *blockDim3 >> > (dev_matrix[pos], *texObj[pos], this->matrixDim, shift - this->matrixDim);
     }
 
     // Check for any errors launching the kernel
@@ -436,7 +472,7 @@ cudaError spift::iteration(int shift) {
 
     // cudaDeviceSynchronize waits for the kernel to finish, and returns
     // any errors encountered during the launch.
-    cudaStatus = cudaSetDevice(this->GPUIndex);
+    cudaStatus = cudaSetDevice(this->GPUIndex[pos]);
     cudaStatus = cudaDeviceSynchronize();
        
     if (cudaStatus != cudaSuccess) {
@@ -448,14 +484,14 @@ cudaError spift::iteration(int shift) {
 }
 
 
-cudaError_t spift::initTexture() {
+cudaError_t spift::initTexture(int pos) {
 
 
     // Specify texture
     struct cudaResourceDesc resDesc;
     memset(&resDesc, 0, sizeof(resDesc));
     resDesc.resType = cudaResourceTypeArray;
-    resDesc.res.array.array = *(this->cuArray);
+    resDesc.res.array.array = *(this->cuArray[pos]);
     // Specify texture object parameters
     struct cudaTextureDesc texDesc;
     memset(&texDesc, 0, sizeof(texDesc));
@@ -466,8 +502,8 @@ cudaError_t spift::initTexture() {
     texDesc.normalizedCoords = 0;
 
     // Create texture object
-    cudaSetDevice(this->GPUIndex);
-    cudaCreateTextureObject(texObj, &resDesc, &texDesc, NULL);
+    cudaSetDevice(this->GPUIndex[pos]);
+    cudaCreateTextureObject(this->texObj[pos], &resDesc, &texDesc, NULL);
     auto cudaStatus = cudaGetLastError();
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "textureInit failed: %s\n", cudaGetErrorString(cudaStatus));
@@ -518,13 +554,10 @@ float* spift::computeShift(int u, int v, std::complex<float> vis, bool isRowShif
 
 void spift::initTwiddle() {
     this->twiddleFactors = new std::complex<float>[this->matrixDim];
-    //std::cout << "twiddleFactors:" << std::endl;
     for(int k = 0; k < this->matrixDim; ++k){
         std::complex<float> next = std::exp(std::complex<float>(0, k * 2 * M_PI / this->matrixDim));
         this->twiddleFactors[k] = next;
-        //std::cout << next << ", ";
     }
-    //std::cout << std::endl;
 }
 
 spift::~spift()
@@ -552,7 +585,8 @@ spift::~spift()
 
 
 void parallel(const int GPU_index, const int dim, std::ofstream *times, std::mutex* writeMutex, std::string fileName) {
-    spift* tester = new spift(dim, 16, 100000, GPU_index,  fileName);
+    int gpuIndex[] = { 0,1,2,3,4,5 };
+    spift* tester = new spift(dim, 16, gpuIndex,  fileName);
     //tester->generateShifts();
     //tester->iterate();
     std::thread shifts(&spift::generateShifts, tester);

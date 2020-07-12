@@ -10,7 +10,7 @@ constexpr int shiftedVectorIndex(const int matrix_dim, const int shift, const in
     return ((shift + index) % matrix_dim) * 2;
 }__global__ void updateWithRowShift(cuFloatComplex* dev_matrix, cudaTextureObject_t dev_vector, const int matrix_dim, const int shift)
 {
-    int start_index = blockIdx.x * blockDim.x * matrix_dim + blockIdx.y * blockDim.x + threadIdx.x;
+    int start_index = blockIdx.y * blockDim.x * matrix_dim + blockIdx.x * blockDim.x + threadIdx.x;
     int vectorPos = (shift * (blockIdx.y * blockDim.x) + threadIdx.x + blockIdx.x * blockDim.x) % matrix_dim;
     for (int i = 0; i < blockDim.x; i++) {
         dev_matrix[start_index + i * matrix_dim].x += tex2D<float>(dev_vector, 2*vectorPos, 0);
@@ -24,7 +24,7 @@ constexpr int shiftedVectorIndex(const int matrix_dim, const int shift, const in
 
 __global__ void updateWithColumnShift(cuFloatComplex* dev_matrix, cudaTextureObject_t dev_vector, const int matrix_dim, const int shift)
 {
-    int start_index = blockIdx.x * blockDim.x * matrix_dim + blockIdx.y * blockDim.x + threadIdx.x;     
+    int start_index = blockIdx.y * blockDim.x * matrix_dim + blockIdx.x * blockDim.x + threadIdx.x;     
     int vectorPos = (shift * (threadIdx.x + blockDim.x * blockIdx.x) + blockIdx.y * blockDim.x) % matrix_dim;
     cuFloatComplex dev_matrix_point;
     for (int i = 0; i < blockDim.x; i++) {

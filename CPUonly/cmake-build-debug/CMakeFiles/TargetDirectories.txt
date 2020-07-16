@@ -1,0 +1,3 @@
+/Users/johannschwabe/Documents/SPIFT/CPUonly/cmake-build-debug/CMakeFiles/rebuild_cache.dir
+/Users/johannschwabe/Documents/SPIFT/CPUonly/cmake-build-debug/CMakeFiles/edit_cache.dir
+/Users/johannschwabe/Documents/SPIFT/CPUonly/cmake-build-debug/CMakeFiles/CPUonly.dir
